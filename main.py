@@ -1,98 +1,87 @@
 from fastapi import FastAPI, Request
 import requests
+import os
 from auth import get_installation_token
-from llm import review_code
-from dotenv import load_dotenv
-import traceback
-
-load_dotenv()
+from llm import generate_review
 
 app = FastAPI()
 
+# --------------------------------------
+# Home route (so browser doesn't show 404)
+# --------------------------------------
+@app.get("/")
+def home():
+    return {
+        "project": "AI Code Reviewer",
+        "status": "Live",
+        "message": "This service automatically reviews GitHub Pull Requests using AI."
+    }
 
+
+# --------------------------------------
+# Webhook route for GitHub
+# --------------------------------------
 @app.post("/webhook")
-async def github_webhook(request: Request):
-    try:
-        payload = await request.json()
+async def webhook(request: Request):
 
-        print("\n==============================")
-        print("🔔 WEBHOOK RECEIVED")
-        print("Action:", payload.get("action"))
-        print("==============================\n")
+    payload = await request.json()
 
-        # Trigger on new PR or updated PR
-        if payload.get("action") in ["opened", "synchronize"]:
+    # Check event type
+    action = payload.get("action")
+    pull_request = payload.get("pull_request")
 
-            pr_number = payload["pull_request"]["number"]
-            repo_name = payload["repository"]["full_name"]
-            installation_id = payload["installation"]["id"]
+    if pull_request is None:
+        return {"message": "No PR data"}
 
-            print(f"📌 PR #{pr_number} in {repo_name}")
-            print(f"🔐 Installation ID: {installation_id}")
+    if action not in ["opened", "synchronize", "reopened"]:
+        return {"message": "Event ignored"}
 
-            # Get GitHub installation token
-            token = get_installation_token(installation_id)
+    repo = payload["repository"]["full_name"]
+    pr_number = pull_request["number"]
+    installation_id = payload["installation"]["id"]
 
-            if not token:
-                print("❌ Failed to get installation token")
-                return {"status": "error getting token"}
+    print(f"PR #{pr_number} in {repo}")
+    print(f"Installation ID: {installation_id}")
 
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json"
-            }
+    # --------------------------------------
+    # Get GitHub installation token
+    # --------------------------------------
+    token = get_installation_token(installation_id)
 
-            # Fetch PR details
-            pr_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-            pr_response = requests.get(pr_url, headers=headers)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
 
-            if pr_response.status_code != 200:
-                print("❌ Failed to fetch PR details")
-                print(pr_response.text)
-                return {"status": "error fetching PR"}
+    # --------------------------------------
+    # Fetch PR diff
+    # --------------------------------------
+    diff_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+    response = requests.get(diff_url, headers=headers)
 
-            pr_data = pr_response.json()
+    diff_data = response.json()
+    diff = diff_data.get("body", "")
 
-            # Fetch diff
-            diff_url = pr_data.get("diff_url")
-            diff_response = requests.get(diff_url, headers=headers)
+    print("🚀 Sending diff to AI...")
 
-            if diff_response.status_code != 200:
-                print("❌ Failed to fetch diff")
-                print(diff_response.text)
-                return {"status": "error fetching diff"}
+    # --------------------------------------
+    # Send diff to AI model
+    # --------------------------------------
+    review = generate_review(diff)
 
-            diff_text = diff_response.text
+    print("🤖 AI Review Generated")
 
-            print("\n🚀 Sending diff to Groq...")
+    # --------------------------------------
+    # Post comment to PR
+    # --------------------------------------
+    comment_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
 
-            # Limit diff size to avoid token overflow
-            diff_text = diff_text[:8000]
+    comment_body = {
+        "body": review
+    }
 
-            # Generate AI review
-            review = review_code(diff_text)
+    requests.post(comment_url, headers=headers, json=comment_body)
 
-            print("\n🤖 AI Review Generated:\n")
-            print(review)
+    print("✅ Comment posted successfully!")
 
-            # Post comment on PR
-            comment_url = f"https://api.github.com/repos/{repo_name}/issues/{pr_number}/comments"
-
-            comment_response = requests.post(
-                comment_url,
-                headers=headers,
-                json={"body": f"## 🤖 AI Code Review\n\n{review}"}
-            )
-
-            if comment_response.status_code == 201:
-                print("\n✅ Comment posted successfully!")
-            else:
-                print("\n❌ Failed to post comment")
-                print(comment_response.text)
-
-        return {"status": "received"}
-
-    except Exception as e:
-        print("\n❌ ERROR OCCURRED:")
-        traceback.print_exc()
-        return {"status": "internal error"}
+    return {"message": "Review completed"}
